@@ -179,7 +179,7 @@ async function fetchWithRetry(url: string, retries = 2): Promise<string> {
     try {
       const res = await fetch(url, {
         headers: buildHeaders(),
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(8000),
       });
 
       if (res.status === 429) {
