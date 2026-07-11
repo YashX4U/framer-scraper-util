@@ -1,0 +1,21 @@
+{
+  "name": "framer-scraper-burner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Burner account scraper for Framer marketplace initial snapshots",
+  "scripts": {
+    "scrape:sitemap": "npx tsx scripts/sitemap-extractor.ts",
+    "scrape:batch": "npx tsx scripts/batch-scraper.ts",
+    "scrape:status": "npx tsx scripts/check-status.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.0",
+    "cheerio": "^1.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "dotenv": "^17.4.2",
+    "tsx": "^4.23.0",
+    "typescript": "^5"
+  }
+}
