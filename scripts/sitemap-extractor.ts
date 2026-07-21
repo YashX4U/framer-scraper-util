@@ -53,9 +53,16 @@ async function fetchWithRetry(url: string, retries = 3): Promise<string> {
   throw new Error("unreachable");
 }
 
-function parseSitemap(xml: string): SitemapEntry[] {
+function parseSitemap(xml: string): { entries: SitemapEntry[]; childSitemaps: string[] } {
   const $ = cheerio.load(xml, { xmlMode: true });
   const entries: SitemapEntry[] = [];
+  const childSitemaps: string[] = [];
+
+  // Check for child sitemaps in sitemap index
+  $("sitemap loc").each((_, el) => {
+    const loc = $(el).text().trim();
+    if (loc) childSitemaps.push(loc);
+  });
 
   $("url").each((_, el) => {
     const loc = $(el).find("loc").text().trim();
@@ -91,7 +98,7 @@ function parseSitemap(xml: string): SitemapEntry[] {
     }
   });
 
-  return entries;
+  return { entries, childSitemaps };
 }
 
 async function main() {
@@ -105,32 +112,42 @@ async function main() {
     "https://www.framer.com/sitemap.xml",
   ];
 
-  let xml = "";
-  let usedUrl = "";
+  const allEntries: SitemapEntry[] = [];
+  const visitedUrls = new Set<string>();
+  const queue = [...sitemapUrls];
 
-  for (const url of sitemapUrls) {
-    console.log(`[sitemap] Trying: ${url}`);
+  while (queue.length > 0) {
+    const targetUrl = queue.shift()!;
+    if (visitedUrls.has(targetUrl)) continue;
+    visitedUrls.add(targetUrl);
+
+    console.log(`[sitemap] Trying: ${targetUrl}`);
     try {
-      xml = await fetchWithRetry(url);
-      usedUrl = url;
-      console.log(`[sitemap] Found sitemap at: ${url}`);
-      break;
+      const xml = await fetchWithRetry(targetUrl);
+      const { entries, childSitemaps } = parseSitemap(xml);
+      console.log(`[sitemap] Found ${entries.length} product URLs in ${targetUrl}`);
+      allEntries.push(...entries);
+
+      for (const childUrl of childSitemaps) {
+        if (!visitedUrls.has(childUrl)) {
+          queue.push(childUrl);
+        }
+      }
     } catch (err) {
       console.log(
-        `[sitemap] Failed: ${err instanceof Error ? err.message : err}`,
+        `[sitemap] Failed ${targetUrl}: ${err instanceof Error ? err.message : err}`,
       );
     }
   }
 
-  if (!xml) {
-    console.error("[sitemap] Could not fetch any sitemap");
-    process.exit(1);
+  // Deduplicate entries by URL
+  const uniqueMap = new Map<string, SitemapEntry>();
+  for (const e of allEntries) {
+    uniqueMap.set(e.url, e);
   }
+  const entries = Array.from(uniqueMap.values());
 
-  console.log("[sitemap] Parsing entries...");
-  const entries = parseSitemap(xml);
-
-  console.log(`[sitemap] Found ${entries.length} product URLs`);
+  console.log(`\n[sitemap] Total unique product URLs found: ${entries.length}`);
 
   const byType = { template: 0, component: 0, plugin: 0 };
   for (const e of entries) byType[e.type]++;
@@ -142,8 +159,6 @@ async function main() {
     console.error(
       "[sitemap] No entries found - sitemap structure may have changed",
     );
-    console.log("[sitemap] Raw XML length:", xml.length);
-    console.log("[sitemap] First 500 chars:", xml.substring(0, 500));
     process.exit(1);
   }
 
@@ -164,16 +179,31 @@ async function main() {
     );
 
     if (error) {
-      console.error(
-        `[sitemap] Error inserting batch ${i / BATCH_SIZE}:`,
-        error.message,
-      );
+      // Fallback: If upsert failed due to missing ON CONFLICT constraint, insert missing rows one by one or in batch
+      console.log(`[sitemap] Upsert failed (${error.message}), trying fallback insert...`);
+      for (const item of batch) {
+        const { data: existing } = await db
+          .from("pending_scrapes")
+          .select("id")
+          .eq("url", item.url)
+          .maybeSingle();
+
+        if (!existing) {
+          await db.from("pending_scrapes").insert({
+            url: item.url,
+            slug: item.slug,
+            marketplace_type: item.type,
+            scraped_at: null,
+          });
+        }
+      }
+      totalInserted += batch.length;
     } else {
       totalInserted += batch.length;
     }
 
     console.log(
-      `[sitemap] Inserted ${totalInserted}/${entries.length} entries`,
+      `[sitemap] Processed ${totalInserted}/${entries.length} entries`,
     );
   }
 

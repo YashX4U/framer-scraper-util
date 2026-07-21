@@ -152,9 +152,30 @@ async function discoverCategories() {
         marketplace_type: type,
       }));
       if (rows.length > 0) {
-        await db
+        const { error } = await db
           .from("categories")
           .upsert(rows, { onConflict: "slug,marketplace_type" });
+
+        if (error) {
+          // Fallback if composite constraint missing: check and insert missing categories
+          console.log(`[discover] Upsert failed (${error.message}), fallback inserting individually...`);
+          for (const cat of categories) {
+            const { data: existing } = await db
+              .from("categories")
+              .select("id")
+              .eq("slug", cat.slug)
+              .eq("marketplace_type", type)
+              .maybeSingle();
+
+            if (!existing) {
+              await db.from("categories").insert({
+                slug: cat.slug,
+                name: cat.name,
+                marketplace_type: type,
+              });
+            }
+          }
+        }
       }
     } catch (err) {
       console.error(
@@ -167,12 +188,20 @@ async function discoverCategories() {
   // CRITICAL FIX: Force add the "All" categories so global ranks work
   console.log("\n[discover] Forcing 'All' global categories...");
   for (const type of ["template", "component", "plugin"]) {
-    await db
+    const { data: existing } = await db
       .from("categories")
-      .upsert(
-        { slug: "all", name: "All", marketplace_type: type },
-        { onConflict: "slug,marketplace_type" },
-      );
+      .select("id")
+      .eq("slug", "all")
+      .eq("marketplace_type", type)
+      .maybeSingle();
+
+    if (!existing) {
+      await db.from("categories").insert({
+        slug: "all",
+        name: "All",
+        marketplace_type: type,
+      });
+    }
   }
 
   const { count } = await db
