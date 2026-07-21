@@ -107,7 +107,15 @@ interface ProductData {
   publishedAt?: string;
   createdAt?: string;
   updatedAt?: string;
-  author?: { name: string; slug?: string; avatar?: string };
+  author?: {
+    name: string;
+    slug?: string;
+    avatar?: string;
+    image?: string;
+    profileImage?: string;
+    picture?: string;
+    photo?: string;
+  };
   attributes?: {
     price?: string | null;
     paid?: boolean;
@@ -191,57 +199,107 @@ function extractProductsListFromRsc(
   rscData: string,
 ): { id: string; title: string }[] {
   const products: { id: string; title: string }[] = [];
-  let searchAt = 0;
+  const seenIds = new Set<string>();
 
+  // Strategy 1: Find the "items":[...] array Framer uses on listing pages.
+  // This gives items in the EXACT order shown on the page.
+  // We use bracket matching instead of regex to handle large arrays safely.
+  const itemsKey = '"items":[';
+  let keyPos = 0;
+  while (keyPos < rscData.length) {
+    const ki = rscData.indexOf(itemsKey, keyPos);
+    if (ki === -1) break;
+    const arrStart = ki + '"items":'.length; // position of '['
+    // Bracket-match to find the end of this array
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let arrEnd = -1;
+    for (let i = arrStart; i < rscData.length; i++) {
+      const ch = rscData[i];
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (!inStr) {
+        if (ch === "[" || ch === "{") depth++;
+        if (ch === "]" || ch === "}") {
+          depth--;
+          if (depth === 0) { arrEnd = i + 1; break; }
+        }
+      }
+    }
+    if (arrEnd !== -1) {
+      const rawArr = rscData.substring(arrStart, arrEnd);
+      // Only attempt parse if it looks like it contains product objects
+      if (rawArr.includes('"slug"') && rawArr.includes('"title"')) {
+        try {
+          const cleaned = rawArr.replace(/"?\$\d+"?/g, "null");
+          const arr = JSON.parse(cleaned);
+          if (Array.isArray(arr) && arr.length > 0) {
+            for (const item of arr) {
+              const id = item?.id;
+              const title = item?.title || item?.name || item?.node?.title;
+              if (id && title && !seenIds.has(id)) {
+                seenIds.add(id);
+                products.push({ id, title });
+              }
+            }
+            if (products.length > 0) {
+              return products;
+            }
+          }
+        } catch {
+          // fall through to strategy 2
+        }
+      }
+      keyPos = arrEnd;
+    } else {
+      keyPos = ki + 1;
+    }
+  }
+
+  // Strategy 2: Scan for individual product objects. A Framer product on a listing page
+  // always has BOTH "id" (UUID) AND "slug" fields. This filters out nav items, categories,
+  // and author objects which only have id+name but no slug.
+  let searchAt = 0;
   while (true) {
     const start = rscData.indexOf('{"id":"', searchAt);
     if (start === -1) break;
 
-    const snippet = rscData.substring(start, start + 500);
-    if (!snippet.includes('"title":"')) {
-      searchAt = start + 1;
-      continue;
-    }
-
+    // Walk the full object boundaries
     let depth = 0;
     let inStr = false;
     let esc = false;
     let end = -1;
     for (let i = start; i < rscData.length; i++) {
       const ch = rscData[i];
-      if (esc) {
-        esc = false;
-        continue;
-      }
-      if (ch === "\\") {
-        esc = true;
-        continue;
-      }
-      if (ch === '"') {
-        inStr = !inStr;
-        continue;
-      }
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
       if (!inStr) {
         if (ch === "{") depth++;
         if (ch === "}") {
           depth--;
-          if (depth === 0) {
-            end = i + 1;
-            break;
-          }
+          if (depth === 0) { end = i + 1; break; }
         }
       }
     }
     if (end === -1) break;
 
-    const objStr = rscData.substring(start, end).replace(/"\$\d+"/g, "null");
+    const objStr = rscData.substring(start, end).replace(/"?\$\d+"?/g, "null");
     try {
       const obj = JSON.parse(objStr);
-      if (obj.id && obj.title) {
-        products.push({ id: obj.id, title: obj.title });
+      const id = obj.id;
+      // MUST have both id AND slug to be a product (not a category/nav/author object)
+      const slug = obj.slug;
+      const title = obj.title || obj.name || obj.node?.title || obj.node?.name;
+
+      if (id && slug && title && !seenIds.has(id)) {
+        seenIds.add(id);
+        products.push({ id, title });
       }
     } catch {
-      // skip
+      // skip malformed JSON
     }
     searchAt = end;
   }
@@ -297,7 +355,7 @@ async function scrapeProductPage(
   comments_count: number;
   updated_at: string | null;
   raw_categories: { slug: string; name: string }[];
-} | null> {
+}> {
   const html = await fetchWithRetry(url);
   const rscData = extractRscData(html);
 
@@ -336,7 +394,13 @@ async function scrapeProductPage(
     title: product.title,
     creator: product.author?.name || "Unknown",
     creator_url: creatorUrl,
-    creator_avatar: product.author?.avatar || "",
+    creator_avatar:
+      product.author?.avatar ||
+      product.author?.image ||
+      product.author?.profileImage ||
+      product.author?.picture ||
+      product.author?.photo ||
+      "",
     category:
       cats
         .map((c) => c.name)
@@ -401,18 +465,17 @@ async function scrapeCategoryRanks() {
     .select("*")
     .order("marketplace_type")
     .order("slug");
-
-  if (error) {
-    console.error("[cats] Failed to fetch categories:", error.message);
+  if (error || !categories || categories.length === 0) {
+    console.error(
+      "[cats] Failed to fetch categories or none found:",
+      error?.message,
+    );
     return;
   }
 
-  if (!categories || categories.length === 0) {
-    console.log("[cats] No categories found in DB");
-    return;
-  }
-
-  console.log(`[cats] Scraping ranks for ${categories.length} categories`);
+  console.log(
+    `[cats] Scraping EXACT sequence for ${categories.length} categories`,
+  );
 
   let totalSnapshots = 0;
   let catErrors = 0;
@@ -421,14 +484,21 @@ async function scrapeCategoryRanks() {
     try {
       const type = cat.marketplace_type;
       const pluralType = type + "s";
-      const url = `https://www.framer.com/community/marketplace/${pluralType}/categories/${cat.slug}/`;
 
-      console.log(`[cats] ${cat.name} (${type})`);
+      // FIX: Build correct URL for "all" vs sub-categories
+      const url =
+        cat.slug === "all"
+          ? `https://www.framer.com/community/marketplace/${pluralType}/all/`
+          : `https://www.framer.com/community/marketplace/${pluralType}/categories/${cat.slug}/`;
+
+      console.log(`[cats] ${cat.name} (${type}) -> ${url}`);
 
       let pageUrl: string | null = url;
       let position = 0;
       let pageNum = 0;
-      const allRowsForCategory: any[] = []; // Collect all rows here
+      const allRowsForCategory: { product_id: string; position: number }[] = [];
+      const snapDate = new Date().toISOString().split("T")[0];
+      const capturedAt = new Date().toISOString();
 
       while (pageUrl) {
         pageNum++;
@@ -441,14 +511,10 @@ async function scrapeCategoryRanks() {
           break;
         }
 
-        // Push to array instead of writing to DB
         for (let i = 0; i < products.length; i++) {
           allRowsForCategory.push({
             product_id: products[i].id,
-            category_id: cat.id,
             position: position + i + 1,
-            captured_at: new Date().toISOString(),
-            snap_date: new Date().toISOString().split("T")[0], // ADD THIS
           });
         }
 
@@ -458,7 +524,7 @@ async function scrapeCategoryRanks() {
         if (cursorMatch) {
           pageUrl = `${url}?cursor=${encodeURIComponent(cursorMatch[1])}`;
           console.log(
-            `  page ${pageNum}: ${products.length} items, next page found`,
+            `  page ${pageNum}: ${products.length} items, cursor found, fetching next`,
           );
           await randomDelay();
         } else {
@@ -469,18 +535,66 @@ async function scrapeCategoryRanks() {
         }
       }
 
-      // ONE single database insert per category instead of per page
+      console.log(`  Total scraped from Framer: ${allRowsForCategory.length} items`);
+
       if (allRowsForCategory.length > 0) {
-        const { error: ie } = await db
-          .from("category_snapshots")
-          .upsert(allRowsForCategory, {
-            onConflict: "product_id,category_id,snap_date",
-            ignoreDuplicates: true,
-          });
-        if (ie) {
-          console.error(`  DB insert error: ${ie.message}`);
-        } else {
-          totalSnapshots += allRowsForCategory.length;
+        // CRITICAL: Only insert snapshots for product_ids that exist in the products table.
+        // This avoids FK violations. Products scraped by the parallel batch jobs are in the
+        // products table; any IDs missing here are from items not yet scraped.
+        const allIds = allRowsForCategory.map((r) => r.product_id);
+
+        // Check in chunks of 500 to avoid URL length limits
+        const existingIds = new Set<string>();
+        for (let ci = 0; ci < allIds.length; ci += 500) {
+          const chunk = allIds.slice(ci, ci + 500);
+          const { data: existing } = await db
+            .from("products")
+            .select("id")
+            .in("id", chunk);
+          if (existing) {
+            for (const row of existing) existingIds.add(row.id);
+          }
+        }
+
+        const validRows = allRowsForCategory
+          .filter((r) => existingIds.has(r.product_id))
+          .map((r) => ({
+            product_id: r.product_id,
+            category_id: cat.id,
+            position: r.position,
+            captured_at: capturedAt,
+            snap_date: snapDate,
+          }));
+
+        const missing = allRowsForCategory.length - validRows.length;
+        if (missing > 0) {
+          console.log(`  WARNING: ${missing} items not yet in products table (still being scraped by other jobs), skipping their snapshots`);
+        }
+
+        if (validRows.length > 0) {
+          // Delete old snapshots for this category+date first, then insert fresh ones
+          // This ensures we always have the correct order (no stale duplicates)
+          await db
+            .from("category_snapshots")
+            .delete()
+            .eq("category_id", cat.id)
+            .eq("snap_date", snapDate);
+
+          const CHUNK = 500;
+          let inserted = 0;
+          for (let ci = 0; ci < validRows.length; ci += CHUNK) {
+            const chunk = validRows.slice(ci, ci + CHUNK);
+            const { error: ie } = await db
+              .from("category_snapshots")
+              .insert(chunk);
+            if (ie) {
+              console.error(`  DB insert error (chunk ${ci}): ${ie.message}`);
+            } else {
+              inserted += chunk.length;
+            }
+          }
+          totalSnapshots += inserted;
+          console.log(`  Inserted ${inserted} / ${allRowsForCategory.length} snapshots (${missing} skipped, not yet in products table)`);
         }
       }
 

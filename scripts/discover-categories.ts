@@ -11,25 +11,9 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const db = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const MARKETPLACE_PAGES: { url: string; type: string }[] = [
-  {
-    url: "https://www.framer.com/community/marketplace/templates/all",
-    type: "template",
-  },
-  {
-    url: "https://www.framer.com/community/marketplace/components/all",
-    type: "component",
-  },
-  {
-    url: "https://www.framer.com/community/marketplace/plugins/all",
-    type: "plugin",
-  },
-];
-
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
 ];
 
 function buildHeaders(): Record<string, string> {
@@ -107,54 +91,27 @@ interface Category {
 function extractCategoriesFromRsc(rscData: string): Category[] {
   const cats: Category[] = [];
   const seen = new Set<string>();
-
-  // Look for category-like objects: {"slug":"...","name":"..."}
-  const slugNamePattern = /\{"slug":"([^"]+)","name":"([^"]+)"\}/g;
-  let match;
-  while ((match = slugNamePattern.exec(rscData)) !== null) {
-    const slug = match[1];
-    const name = match[2];
-    if (!seen.has(slug) && slug && name && !slug.startsWith("http")) {
-      seen.add(slug);
-      cats.push({ slug, name });
+  const patterns = [
+    /\{"slug":"([^"]+)","name":"([^"]+)"\}/g,
+    /\{"name":"([^"]+)","slug":"([^"]+)"\}/g,
+  ];
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(rscData)) !== null) {
+      const slug = pattern === patterns[0] ? match[1] : match[2];
+      const name = pattern === patterns[0] ? match[2] : match[1];
+      if (
+        !seen.has(slug) &&
+        slug &&
+        name &&
+        !slug.startsWith("http") &&
+        slug !== "all"
+      ) {
+        seen.add(slug);
+        cats.push({ slug, name });
+      }
     }
   }
-
-  // Also try reversed order: {"name":"...","slug":"..."}
-  const nameSlugPattern = /\{"name":"([^"]+)","slug":"([^"]+)"\}/g;
-  while ((match = nameSlugPattern.exec(rscData)) !== null) {
-    const name = match[1];
-    const slug = match[2];
-    if (!seen.has(slug) && slug && name && !slug.startsWith("http")) {
-      seen.add(slug);
-      cats.push({ slug, name });
-    }
-  }
-
-  return cats;
-}
-
-function extractCategoriesFromHtml(html: string): Category[] {
-  const cats: Category[] = [];
-  const seen = new Set<string>();
-
-  // Match category links: /community/marketplace/{type}s/categories/{slug}/
-  const linkPattern =
-    /\/community\/marketplace\/\w+s\/categories\/([a-z0-9-]+)\//g;
-  let match;
-  while ((match = linkPattern.exec(html)) !== null) {
-    const slug = match[1];
-    if (!seen.has(slug)) {
-      seen.add(slug);
-      // Convert slug to name: "my-category" → "My Category"
-      const name = slug
-        .split("-")
-        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-        .join(" ");
-      cats.push({ slug, name });
-    }
-  }
-
   return cats;
 }
 
@@ -163,72 +120,65 @@ async function discoverCategories() {
   console.log("[discover] CATEGORY DISCOVERY");
   console.log("=".repeat(50));
 
-  let totalInserted = 0;
+  const pages = [
+    {
+      url: "https://www.framer.com/community/marketplace/templates/all",
+      type: "template",
+    },
+    {
+      url: "https://www.framer.com/community/marketplace/components/all",
+      type: "component",
+    },
+    {
+      url: "https://www.framer.com/community/marketplace/plugins/all",
+      type: "plugin",
+    },
+  ];
 
-  for (const { url, type } of MARKETPLACE_PAGES) {
+  for (const { url, type } of pages) {
     console.log(`\n[discover] Fetching ${type}s: ${url}`);
-
     try {
       const html = await fetchWithRetry(url);
       const rscData = extractRscData(html);
-
-      // Try RSC extraction first, fall back to HTML parsing
-      let categories = extractCategoriesFromRsc(rscData);
-      if (categories.length === 0) {
-        categories = extractCategoriesFromHtml(html);
-      }
+      const categories = extractCategoriesFromRsc(rscData);
 
       console.log(
-        `[discover] Found ${categories.length} categories for ${type}s`,
+        `[discover] Found ${categories.length} sub-categories for ${type}s`,
       );
 
-      if (categories.length === 0) {
-        console.log(
-          `[discover] WARNING: No categories found. Page structure may have changed.`,
-        );
-        console.log(
-          `[discover] RSC data length: ${rscData.length}, HTML length: ${html.length}`,
-        );
-        continue;
-      }
-
-      // Upsert all categories for this marketplace type
       const rows = categories.map((cat) => ({
         slug: cat.slug,
         name: cat.name,
         marketplace_type: type,
       }));
-
-      const { error } = await db.from("categories").upsert(rows, {
-        onConflict: "slug,marketplace_type",
-      });
-
-      if (error) {
-        console.error(`[discover] DB error for ${type}s: ${error.message}`);
-      } else {
-        totalInserted += categories.length;
-        for (const cat of categories) {
-          console.log(`  + ${cat.name} (${cat.slug})`);
-        }
+      if (rows.length > 0) {
+        await db
+          .from("categories")
+          .upsert(rows, { onConflict: "slug,marketplace_type" });
       }
     } catch (err) {
       console.error(
-        `[discover] Failed to fetch ${type}s: ${err instanceof Error ? err.message : err}`,
+        `[discover] Failed: ${err instanceof Error ? err.message : err}`,
       );
     }
-
-    // Small delay between pages
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  // Summary
+  // CRITICAL FIX: Force add the "All" categories so global ranks work
+  console.log("\n[discover] Forcing 'All' global categories...");
+  for (const type of ["template", "component", "plugin"]) {
+    await db
+      .from("categories")
+      .upsert(
+        { slug: "all", name: "All", marketplace_type: type },
+        { onConflict: "slug,marketplace_type" },
+      );
+  }
+
   const { count } = await db
     .from("categories")
     .select("*", { count: "exact", head: true });
-
-  console.log("\n" + "=".repeat(50));
-  console.log(`[discover] COMPLETE! Total categories in DB: ${count}`);
-  console.log("=".repeat(50));
+  console.log(`\n[discover] COMPLETE! Total categories in DB: ${count}`);
 }
 
 discoverCategories();

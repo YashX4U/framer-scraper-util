@@ -123,11 +123,30 @@ jobs:
           BATCH_SIZE: ${{ github.event.inputs.batch_size || '200' }}
           DELAY_MIN: ${{ github.event.inputs.delay_min || '1200' }}
           DELAY_MAX: ${{ github.event.inputs.delay_max || '2500' }}
-          RUN_MODE: both
+          RUN_MODE: products
 
-  # NEW: Build rankings after scraping
-  build-rankings:
+  # Run category rank scraping ONCE, sequentially, after ALL product scrapes finish
+  # This avoids the race condition of 50 parallel jobs all trying to populate category_snapshots
+  category-ranks:
     needs: scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsx scripts/batch-scraper.ts
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_MODE: categories
+
+  # Build rankings AFTER category snapshots are complete
+  build-rankings:
+    needs: category-ranks
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
