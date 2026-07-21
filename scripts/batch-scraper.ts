@@ -13,9 +13,10 @@ const db = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const BATCH_INDEX = parseInt(process.env.BATCH_INDEX || "0", 10);
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
-const DELAY_MIN = parseInt(process.env.DELAY_MIN || "800", 10);
-const DELAY_MAX = parseInt(process.env.DELAY_MAX || "2000", 10);
+const DELAY_MIN = parseInt(process.env.DELAY_MIN || "150", 10);
+const DELAY_MAX = parseInt(process.env.DELAY_MAX || "400", 10);
 const MARKETPLACE_TYPE = process.env.MARKETPLACE_TYPE || null;
+const RUN_MODE = process.env.RUN_MODE || "both";
 
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -43,8 +44,20 @@ function buildHeaders(): Record<string, string> {
   };
 }
 
+let requestCount = 0;
 function randomDelay(): Promise<void> {
-  const delay = DELAY_MIN + Math.random() * (DELAY_MAX - DELAY_MIN);
+  requestCount++;
+  let delay: number;
+
+  // First 5 requests: act cautious (500ms - 1200ms) to pass initial bot checks
+  if (requestCount <= 5) {
+    delay = 500 + Math.random() * 700;
+  }
+  // After that: drop to fast burner mode (150ms - 400ms)
+  else {
+    delay = DELAY_MIN + Math.random() * (DELAY_MAX - DELAY_MIN);
+  }
+
   return new Promise((r) => setTimeout(r, delay));
 }
 
@@ -94,7 +107,7 @@ interface ProductData {
   publishedAt?: string;
   createdAt?: string;
   updatedAt?: string;
-  author?: { name: string; slug?: string };
+  author?: { name: string; slug?: string; avatar?: string };
   attributes?: {
     price?: string | null;
     paid?: boolean;
@@ -174,6 +187,68 @@ function extractProductFromRsc(rscData: string): ProductData | null {
   return null;
 }
 
+function extractProductsListFromRsc(
+  rscData: string,
+): { id: string; title: string }[] {
+  const products: { id: string; title: string }[] = [];
+  let searchAt = 0;
+
+  while (true) {
+    const start = rscData.indexOf('{"id":"', searchAt);
+    if (start === -1) break;
+
+    const snippet = rscData.substring(start, start + 500);
+    if (!snippet.includes('"title":"')) {
+      searchAt = start + 1;
+      continue;
+    }
+
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let end = -1;
+    for (let i = start; i < rscData.length; i++) {
+      const ch = rscData[i];
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = !inStr;
+        continue;
+      }
+      if (!inStr) {
+        if (ch === "{") depth++;
+        if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            end = i + 1;
+            break;
+          }
+        }
+      }
+    }
+    if (end === -1) break;
+
+    const objStr = rscData.substring(start, end).replace(/"\$\d+"/g, "null");
+    try {
+      const obj = JSON.parse(objStr);
+      if (obj.id && obj.title) {
+        products.push({ id: obj.id, title: obj.title });
+      }
+    } catch {
+      // skip
+    }
+    searchAt = end;
+  }
+
+  return products;
+}
+
 async function fetchWithRetry(url: string, retries = 2): Promise<string> {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -211,6 +286,7 @@ async function scrapeProductPage(
   title: string;
   creator: string;
   creator_url: string;
+  creator_avatar: string;
   category: string;
   is_free: boolean;
   thumbnail: string;
@@ -220,6 +296,7 @@ async function scrapeProductPage(
   likes: number;
   comments_count: number;
   updated_at: string | null;
+  raw_categories: { slug: string; name: string }[];
 } | null> {
   const html = await fetchWithRetry(url);
   const rscData = extractRscData(html);
@@ -252,14 +329,17 @@ async function scrapeProductPage(
     ? `https://www.framer.com/community/creator/@${authorSlug}/`
     : "";
 
+  const cats = product.attributes?.categories || [];
+
   return {
     id: product.id,
     title: product.title,
     creator: product.author?.name || "Unknown",
     creator_url: creatorUrl,
+    creator_avatar: product.author?.avatar || "",
     category:
-      product.attributes?.categories
-        ?.map((c) => c.name)
+      cats
+        .map((c) => c.name)
         .filter(Boolean)
         .join(", ") || "",
     is_free: expectedType === "plugin" ? !isPluginPaid : isFree,
@@ -270,18 +350,154 @@ async function scrapeProductPage(
     likes: product.post?.likes?.count || 0,
     comments_count: product.post?.comments?.count || 0,
     updated_at: product.updatedAt || null,
+    raw_categories: cats.map((c) => ({ slug: c.slug, name: c.name })),
   };
 }
 
-async function main() {
-  console.log("=".repeat(50));
-  console.log(`[batch] BATCH SCRAPER #${BATCH_INDEX}`);
-  console.log(
-    `[batch] Size: ${BATCH_SIZE}, Delay: ${DELAY_MIN}-${DELAY_MAX}ms`,
-  );
-  if (MARKETPLACE_TYPE) console.log(`[batch] Type filter: ${MARKETPLACE_TYPE}`);
-  console.log("=".repeat(50));
+async function upsertProductCategories(
+  productId: string,
+  marketplaceType: string,
+  categories: { slug: string; name: string }[],
+) {
+  if (categories.length === 0) return;
 
+  for (const cat of categories) {
+    const { data: existing } = await db
+      .from("categories")
+      .select("id")
+      .eq("slug", cat.slug)
+      .eq("marketplace_type", marketplaceType)
+      .maybeSingle();
+
+    let categoryId: number;
+    if (existing) {
+      categoryId = existing.id;
+    } else {
+      const { data: inserted } = await db
+        .from("categories")
+        .insert({
+          slug: cat.slug,
+          name: cat.name,
+          marketplace_type: marketplaceType,
+        })
+        .select("id")
+        .single();
+      if (!inserted) throw new Error("Failed to insert category");
+      categoryId = inserted.id;
+    }
+
+    await db
+      .from("product_categories")
+      .upsert(
+        { product_id: productId, category_id: categoryId },
+        { onConflict: "product_id,category_id" },
+      );
+  }
+}
+
+async function scrapeCategoryRanks() {
+  const { data: categories, error } = await db
+    .from("categories")
+    .select("*")
+    .order("marketplace_type")
+    .order("slug");
+
+  if (error) {
+    console.error("[cats] Failed to fetch categories:", error.message);
+    return;
+  }
+
+  if (!categories || categories.length === 0) {
+    console.log("[cats] No categories found in DB");
+    return;
+  }
+
+  console.log(`[cats] Scraping ranks for ${categories.length} categories`);
+
+  let totalSnapshots = 0;
+  let catErrors = 0;
+
+  for (const cat of categories) {
+    try {
+      const type = cat.marketplace_type;
+      const pluralType = type + "s";
+      const url = `https://www.framer.com/community/marketplace/${pluralType}/categories/${cat.slug}/`;
+
+      console.log(`[cats] ${cat.name} (${type})`);
+
+      let pageUrl: string | null = url;
+      let position = 0;
+      let pageNum = 0;
+      const allRowsForCategory: any[] = []; // Collect all rows here
+
+      while (pageUrl) {
+        pageNum++;
+        const html = await fetchWithRetry(pageUrl);
+        const rscData = extractRscData(html);
+        const products = extractProductsListFromRsc(rscData);
+
+        if (products.length === 0) {
+          console.log(`  page ${pageNum}: empty, stopping.`);
+          break;
+        }
+
+        // Push to array instead of writing to DB
+        for (let i = 0; i < products.length; i++) {
+          allRowsForCategory.push({
+            product_id: products[i].id,
+            category_id: cat.id,
+            position: position + i + 1,
+            captured_at: new Date().toISOString(),
+            snap_date: new Date().toISOString().split("T")[0], // ADD THIS
+          });
+        }
+
+        position += products.length;
+
+        const cursorMatch = rscData.match(/"cursor":"([^"]+)"/);
+        if (cursorMatch) {
+          pageUrl = `${url}?cursor=${encodeURIComponent(cursorMatch[1])}`;
+          console.log(
+            `  page ${pageNum}: ${products.length} items, next page found`,
+          );
+          await randomDelay();
+        } else {
+          console.log(
+            `  page ${pageNum}: ${products.length} items, no more pages`,
+          );
+          pageUrl = null;
+        }
+      }
+
+      // ONE single database insert per category instead of per page
+      if (allRowsForCategory.length > 0) {
+        const { error: ie } = await db
+          .from("category_snapshots")
+          .upsert(allRowsForCategory, {
+            onConflict: "product_id,category_id,snap_date",
+            ignoreDuplicates: true,
+          });
+        if (ie) {
+          console.error(`  DB insert error: ${ie.message}`);
+        } else {
+          totalSnapshots += allRowsForCategory.length;
+        }
+      }
+
+      await randomDelay();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[cats] FAILED ${cat.slug}: ${msg}`);
+      catErrors++;
+    }
+  }
+
+  console.log(
+    `[cats] Done: ${totalSnapshots} snapshots across ${categories.length} categories (${catErrors} errors)`,
+  );
+}
+
+async function runProductScrapes() {
   let query = db
     .from("pending_scrapes")
     .select("*")
@@ -292,18 +508,16 @@ async function main() {
     query = query.eq("marketplace_type", MARKETPLACE_TYPE);
   }
 
-  const { count: totalCount } = await db
+  let countQuery = db
     .from("pending_scrapes")
     .select("*", { count: "exact", head: true })
-    .is("scraped_at", null)
-    .eq(
-      MARKETPLACE_TYPE ? "marketplace_type" : "id",
-      MARKETPLACE_TYPE ? MARKETPLACE_TYPE : 0,
-    )
-    .neq(
-      MARKETPLACE_TYPE ? "marketplace_type" : "id",
-      MARKETPLACE_TYPE ? "" : 0,
-    );
+    .is("scraped_at", null);
+
+  if (MARKETPLACE_TYPE) {
+    countQuery = countQuery.eq("marketplace_type", MARKETPLACE_TYPE);
+  }
+
+  const { count: totalCount } = await countQuery;
 
   const offset = BATCH_INDEX * BATCH_SIZE;
   const { data: entries, error } = await query.range(
@@ -345,12 +559,21 @@ async function main() {
         entry.marketplace_type,
       );
 
+      if (productData.raw_categories.length > 0) {
+        await upsertProductCategories(
+          productData.id,
+          entry.marketplace_type,
+          productData.raw_categories,
+        );
+      }
+
       const { error: upsertError } = await db.from("products").upsert(
         {
           id: productData.id,
           title: productData.title,
           creator: productData.creator,
           creator_url: productData.creator_url,
+          creator_avatar: productData.creator_avatar,
           url: entry.url,
           category: productData.category,
           marketplace_type: entry.marketplace_type,
@@ -416,7 +639,7 @@ async function main() {
 
   console.log("");
   console.log("=".repeat(50));
-  console.log(`[batch] COMPLETE`);
+  console.log(`[batch] PRODUCT SCRAPE COMPLETE`);
   console.log(`[batch]   Success: ${success}`);
   console.log(`[batch]   Failed:  ${failed} (404s skipped: ${skipped})`);
   console.log(`[batch]   Total:   ${entries.length}`);
@@ -430,6 +653,31 @@ async function main() {
   if (failed > entries.length * 0.5) {
     process.exit(1);
   }
+}
+
+async function main() {
+  console.log("=".repeat(50));
+  console.log(`[batch] BATCH SCRAPER #${BATCH_INDEX}`);
+  console.log(
+    `[batch] Size: ${BATCH_SIZE}, Delay: ${DELAY_MIN}-${DELAY_MAX}ms`,
+  );
+  console.log(`[batch] Mode: ${RUN_MODE}`);
+  if (MARKETPLACE_TYPE) console.log(`[batch] Type filter: ${MARKETPLACE_TYPE}`);
+  console.log("=".repeat(50));
+
+  if (RUN_MODE === "products" || RUN_MODE === "both") {
+    await runProductScrapes();
+  }
+
+  if (RUN_MODE === "categories" || RUN_MODE === "both") {
+    console.log("\n");
+    await scrapeCategoryRanks();
+  }
+
+  console.log("");
+  console.log("=".repeat(50));
+  console.log(`[batch] ALL DONE`);
+  console.log("=".repeat(50));
 }
 
 main();
