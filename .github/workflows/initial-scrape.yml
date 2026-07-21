@@ -6,15 +6,15 @@ on:
       batch_size:
         description: "Products per job"
         required: false
-        default: "200"
+        default: "500" # INCREASED from 200 to 500
       delay_min:
         description: "Min delay (ms)"
         required: false
-        default: "1200"
+        default: "600" # DECREASED from 1200 to 600
       delay_max:
         description: "Max delay (ms)"
         required: false
-        default: "2500"
+        default: "1200" # DECREASED from 2500 to 1200
 
 jobs:
   sitemap:
@@ -106,34 +106,6 @@ jobs:
             47,
             48,
             49,
-            50,
-            51,
-            52,
-            53,
-            54,
-            55,
-            56,
-            57,
-            58,
-            59,
-            60,
-            61,
-            62,
-            63,
-            64,
-            65,
-            66,
-            67,
-            68,
-            69,
-            70,
-            71,
-            72,
-            73,
-            74,
-            75,
-            76,
-            77,
           ]
       fail-fast: false
     steps:
